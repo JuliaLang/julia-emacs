@@ -51,6 +51,20 @@
   "Number of spaces per indentation level."
   :type 'integer)
 
+(defcustom julia-force-tab-complete t
+  "Use Tab for completion instead of M-Tab in `julia-mode'.
+This overrides `tab-always-indent' in `julia-mode' buffers."
+  :type 'boolean)
+
+(defcustom julia-automatic-latexsub t
+  "After completing a LaTeX symbol, replace it with corresponding unicode.
+`ivy-mode' completion will not trigger automatic latexsub due to
+upstream bug: <https://github.com/abo-abo/swiper/issues/2345>.
+
+User can still use `abbrev-mode' or `expand-abbrev' to substitute
+unicode for LaTeX even if disabled."
+  :type 'boolean)
+
 (defface julia-macro-face
   '((t :inherit font-lock-preprocessor-face))
   "Face for Julia macro invocations.")
@@ -364,6 +378,12 @@ As a result, it is true inside \"foo\", `foo` and 'f'."
      ;; of overlapping triple-quotes with first escaped
      ((backward-char 2)))))
 
+(defun julia-in-multiline-string (&optional syntax-pps)
+  "Return non-nil if point is inside multi-line string using SYNTAX-PPS."
+  (and (julia-in-string syntax-pps)
+       (save-excursion (beginning-of-line)
+                       (julia-in-string syntax-pps))))
+
 (defun julia-in-brackets ()
   "Return non-nil if point is inside square brackets."
   (let ((start-pos (point))
@@ -558,19 +578,6 @@ only comments."
             ;; above
             (+ julia-indent-offset prev-indent)))))))
 
-(defun julia-indent-in-string ()
-  "Indentation inside strings with newlines is \"manual\",
-meaning always increase indent on TAB and decrease on S-TAB."
-  (save-excursion
-    (beginning-of-line)
-    (when (julia-in-string)
-      (if (member this-command '(julia-latexsub-or-indent
-                                 ess-indent-or-complete))
-          (+ julia-indent-offset (current-indentation))
-        ;; return the current indentation to prevent other functions from
-        ;; indenting inside strings
-        (current-indentation)))))
-
 (defun julia-indent-import-export-using ()
   "Indent offset for lines that follow `import` or `export`, otherwise nil."
   (when (julia-following-import-export-using)
@@ -579,37 +586,36 @@ meaning always increase indent on TAB and decrease on S-TAB."
 (defun julia-indent-line ()
   "Indent current line of julia code."
   (interactive)
-  (let* ((point-offset (- (current-column) (current-indentation))))
-    (indent-line-to
-     (or
-      ;; note: if this first function returns nil the beginning of the line
-      ;; cannot be in a string
-      (julia-indent-in-string)
-      ;; If we're inside an open paren, indent to line up arguments. After this,
-      ;; we cannot be inside parens which includes brackets
-      (julia-paren-indent)
-      ;; indent due to hanging operators (lines ending in an operator)
-      (julia-indent-hanging)
-      ;; indent for import and export
-      (julia-indent-import-export-using)
-      ;; Indent according to how many nested blocks we are in.
-      (save-excursion
-        (beginning-of-line)
-        ;; jump out of any comments
-        (let ((state (syntax-ppss)))
-          (when (nth 4 state)
-            (goto-char (nth 8 state))))
-        (forward-to-indentation 0)
-        (let ((endtok (julia-at-keyword julia-block-end-keywords))
-              (last-open-block (julia-last-open-block (- (point) julia-max-block-lookback))))
-          (max 0 (+ (or last-open-block 0)
-                    (if (or endtok
-                            (julia-at-keyword julia-block-start-keywords-no-indent))
-                        (- julia-indent-offset) 0)))))))
-    ;; Point is now at the beginning of indentation, restore it
-    ;; to its original position (relative to indentation).
-    (when (>= point-offset 0)
-      (move-to-column (+ (current-indentation) point-offset)))))
+  (if (julia-in-multiline-string)
+      'noindent
+    (let* ((point-offset (- (current-column) (current-indentation))))
+      (indent-line-to
+       (or
+        ;; If we're inside an open paren, indent to line up arguments. After this,
+        ;; we cannot be inside parens which includes brackets
+        (julia-paren-indent)
+        ;; indent due to hanging operators (lines ending in an operator)
+        (julia-indent-hanging)
+        ;; indent for import and export
+        (julia-indent-import-export-using)
+        ;; Indent according to how many nested blocks we are in.
+        (save-excursion
+          (beginning-of-line)
+          ;; jump out of any comments
+          (let ((state (syntax-ppss)))
+            (when (nth 4 state)
+              (goto-char (nth 8 state))))
+          (forward-to-indentation 0)
+          (let ((endtok (julia-at-keyword julia-block-end-keywords))
+                (last-open-block (julia-last-open-block (- (point) julia-max-block-lookback))))
+            (max 0 (+ (or last-open-block 0)
+                      (if (or endtok
+                              (julia-at-keyword julia-block-start-keywords-no-indent))
+                          (- julia-indent-offset) 0)))))))
+      ;; Point is now at the beginning of indentation, restore it
+      ;; to its original position (relative to indentation).
+      (when (>= point-offset 0)
+        (move-to-column (+ (current-indentation) point-offset))))))
 
 
 ;;; Navigation
@@ -727,6 +733,12 @@ Return nil if point is not in a function, otherwise point."
       (end-of-line)
       (point))))
 
+;;; abbrev
+
+(define-abbrev-table 'julia-mode-abbrev-table ()
+  "Abbrev table for Julia mode."
+  :parents (list julia-latexsub-abbrev-table))
+
 ;;; IMENU
 (defvar julia-imenu-generic-expression
   ;; don't use syntax classes, screws egrep
@@ -751,6 +763,7 @@ Return nil if point is not in a function, otherwise point."
 (define-derived-mode julia-mode prog-mode "Julia"
   "Major mode for editing julia code."
   :group 'julia
+  :abbrev-table julia-mode-abbrev-table
   (set-syntax-table julia-mode-syntax-table)
   (setq-local comment-start "# ")
   (setq-local comment-start-skip "#+\\s-*")
@@ -759,6 +772,14 @@ Return nil if point is not in a function, otherwise point."
   (setq-local indent-line-function #'julia-indent-line)
   (setq-local beginning-of-defun-function #'julia-beginning-of-defun)
   (setq-local end-of-defun-function #'julia-end-of-defun)
+  ;; If completion before point has higher priority than around, \lamb
+  ;; can get completed to \lambdamb
+  (add-hook 'completion-at-point-functions
+            #'julia-mode-latexsub-completion-at-point-before nil t)
+  (add-hook 'completion-at-point-functions
+            #'julia-mode-latexsub-completion-at-point-around nil t)
+  (when julia-force-tab-complete
+    (setq-local tab-always-indent 'complete))
   (setq indent-tabs-mode nil)
   (setq imenu-generic-expression julia-imenu-generic-expression)
   (imenu-add-to-menubar "Imenu"))
@@ -772,30 +793,70 @@ strings."
 (define-key julia-mode-map (kbd "<backtab>") 'julia-manual-deindent)
 
 ;; (See Julia issue #8947 for why we don't use the Emacs tex input mode.)
-(defun julia-latexsub ()
-  "Perform a LaTeX-like Unicode symbol substitution."
-  (interactive "*i")
-  (let ((orig-pt (point)))
-    (while (not (or (bobp) (= ?\\ (char-before))
-		    (= ?\s (char-syntax (char-before)))))
+(defun julia--latexsub-start-symbol ()
+  "Determine the start location for LaTeX-like symbol at point.
+If there is not a LaTeX-like symbol at point, return nil."
+  (save-excursion
+    ;; move backward until character can't be part of LaTeX, whitespace or beginning of file
+    (while (not (or (bobp)
+                    (= ?\\ (char-before))
+                    ;; Checks char not in whitespace, comment, or
+                    ;; escape. This works better than checking char is
+                    ;; in word constitutents (?w) because things like
+                    ;; "\^(", "\1/", and "\^=)" are valid.
+                    (member (char-syntax (char-before)) '(?\s ?< ?> ?\\))))
       (backward-char))
-    (if (and (not (bobp)) (= ?\\ (char-before)))
-        (progn
-          (backward-char)
-          (let ((sub (gethash (buffer-substring (point) orig-pt) julia-mode-latexsubs)))
-            (if sub
-                (progn
-                  (delete-region (point) orig-pt)
-                  (insert sub))
-              (goto-char orig-pt))))
-      (goto-char orig-pt))))
+    (when (= ?\\ (char-before))
+      (- (point) 1))))
 
-(defun julia-latexsub-or-indent (arg)
-  "Either indent according to mode or perform a LaTeX-like symbol substution"
-  (interactive "*i")
-  (if (julia-latexsub)
-      (indent-for-tab-command arg)))
-(define-key julia-mode-map (kbd "TAB") 'julia-latexsub-or-indent)
+(defun julia--latexsub-end-symbol ()
+  "Determine the end location for LaTeX-like symbol at point."
+  (save-excursion
+    (while (not (or (eobp)
+                    (member (char-syntax (char-after)) '(?\s ?< ?> ?\\))))
+      (forward-char))
+    (point)))
+
+;; Sometimes you want to complete a symbol point is in middle of
+(defun julia-mode-latexsub-completion-at-point-around ()
+  "Return completion for LaTeX-like symbol around point.
+Suitable for use in `completion-at-point-functions'."
+  (let ((beg (julia--latexsub-start-symbol)))
+    (when beg
+      (list beg (julia--latexsub-end-symbol) julia-mode-latexsubs
+            :exclusive 'no
+            :annotation-function (lambda (s)
+                                   (concat " " (gethash s julia-mode-latexsubs)))
+            :exit-function (julia--latexsub-exit-function beg)))))
+
+;; Sometimes you want to complete a symbol point is at end of (with no space after)
+(defun julia-mode-latexsub-completion-at-point-before ()
+  "Return completion for LaTeX-like symbol before point.
+Suitable for use in `completion-at-point-functions'."
+  (let ((beg (julia--latexsub-start-symbol)))
+    (when beg
+      (list beg (point) julia-mode-latexsubs :exclusive 'no
+            :annotation-function (lambda (s)
+                                   (concat " " (gethash s julia-mode-latexsubs)))
+            :exit-function (julia--latexsub-exit-function beg)))))
+
+(defun julia--latexsub-exit-function (beg)
+  "Return function to be used as `completion-extra-properties' `:exit-function'.
+When `julia-automatic-latexsub' is non-nil, returned function will
+substitute LaTeX symbols when called with a LaTeX string from before
+`point' and the symbol `finished'. BEG is the point in the current
+buffer where the LaTeX symbol starts."
+  (if julia-automatic-latexsub
+      ;; `julia--latexsub-exit-function' returns a lambda in order to close over BEG which
+      ;; would otherwise have to be recalculated.
+      (lambda (name status)
+        ;; `ivy-mode' always calls `:exit-function' with `sole' and not `finished' (see
+        ;; <https://github.com/abo-abo/swiper/issues/2345>). Instead of automatic
+        ;; expansion, user can either enable `abbrev-mode' or call `expand-abbrev'.
+        (when (eq status 'finished)
+          (abbrev-insert (abbrev-symbol name julia-latexsub-abbrev-table) name
+                         beg (point))))
+    #'ignore))
 
 ;; Math insertion in julia. Use it with
 ;; (add-hook 'julia-mode-hook 'julia-math-mode)
@@ -839,10 +900,7 @@ following commands are defined:
   "Regexp for matching `inferior-julia' prompt.")
 
 (defvar inferior-julia-mode-map
-  (let ((map2 (nconc (make-sparse-keymap) comint-mode-map)))
-    ;; example definition
-    (define-key map2 (kbd "TAB") 'julia-latexsub-or-indent)
-    map2)
+  (nconc (make-sparse-keymap) comint-mode-map)
   "Basic mode map for `inferior-julia-mode'.")
 
 ;;;###autoload
@@ -865,11 +923,18 @@ following commands are defined:
 
 \\<inferior-julia-mode-map>"
   nil "Julia"
+  :abbrev-table julia-mode-abbrev-table
   (setq-local comint-prompt-regexp julia-prompt-regexp)
   (setq-local comint-prompt-read-only t)
   (setq-local font-lock-defaults '(julia-font-lock-keywords t))
   (setq-local paragraph-start julia-prompt-regexp)
-  (setq-local indent-line-function #'julia-indent-line))
+  (setq-local indent-line-function #'julia-indent-line)
+  (when julia-force-tab-complete
+    (setq-local tab-always-indent 'complete))
+  (add-hook 'completion-at-point-functions
+            #'julia-mode-latexsub-completion-at-point-before nil t)
+  (add-hook 'completion-at-point-functions
+            #'julia-mode-latexsub-completion-at-point-around nil t))
 
 (add-hook 'inferior-julia-mode-hook #'inferior-julia--initialize)
 
